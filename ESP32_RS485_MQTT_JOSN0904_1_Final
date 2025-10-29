@@ -1,0 +1,514 @@
+#include <ArduinoOTA.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ModbusMaster.h>
+#include <Arduino_JSON.h>
+#include <esp_task_wdt.h>
+
+// WiFi 設定
+//const char* ssid = "SJguest";              // 請替換為您的 WiFi SSID
+//const char* password = "jetguest";         // 請替換為您的 WiFi 密碼
+
+const char* ssid = "1F_IOT";              // 請替換為您的 WiFi SSID
+const char* password = "sanjet25653819";      // 請替換為您的 WiFi 密碼
+
+// MQTT 代理伺服器設定
+
+#define DEVICE_ID "ESP32_RS485" // <<-- !! 每一台 ESP32 必須有不同的值 !!
+//const char* mqtt_server = "192.168.64.60"; // serverIP
+const char* mqtt_server = "192.168.50.138";    
+const int mqtt_port = 1883;
+// MQTT Client ID 也應該是唯一的
+char mqtt_client_id[64]; // Buffer for client ID
+
+// MQTT 主題字串緩衝區 (因為主題現在是動態生成的)
+char topic_led_set[128];
+char topic_led_status[128];
+char topic_modbus_read_req[128];
+char topic_modbus_read_resp[128];
+char topic_modbus_write_req[128];
+char topic_modbus_write_resp[128];
+char topic_status[128];
+
+// LWT (最後遺囑) 設定
+char lwt_topic[128];
+char lwt_payload[128]; // 確保緩衝區足夠大
+const int lwt_qos = 1;
+const boolean lwt_retain = true;
+
+// WiFi 與 MQTT 客戶端物件
+WiFiClient espClient;
+PubSubClient client(espClient);
+#define MSG_BUFFER_SIZE (256)
+char msg[MSG_BUFFER_SIZE];
+bool mqtt_connected = false;
+
+// WiFi 連線設定
+const unsigned long WIFI_TIMEOUT = 10000;
+
+// 內建 LED 引腳
+#define LED_BUILTIN 2
+
+// Modbus 設定
+#define MODBUS_RX_PIN 16
+#define MODBUS_TX_PIN 17
+#define MODBUS_SERIAL_BAUD 9600
+#define MAX_SLAVES 11
+int Address_Offset = 7000;
+
+// ModbusMaster 物件
+ModbusMaster node;
+
+// 函式原型宣告
+void printRSSITask(void *pvParameters);
+void setLEDState(bool state);
+void handleMqttSetLED(byte* payload, unsigned int length);
+void handleMqttReadModbus(byte* payload, unsigned int length);
+void handleMqttWriteModbus(byte* payload, unsigned int length);
+
+void buildTopics() {
+  snprintf(topic_led_set, sizeof(topic_led_set), "devices/%s/led/set", DEVICE_ID);
+  snprintf(topic_led_status, sizeof(topic_led_status), "devices/%s/led/status", DEVICE_ID);
+  snprintf(topic_modbus_read_req, sizeof(topic_modbus_read_req), "devices/%s/modbus/read/request", DEVICE_ID);
+  snprintf(topic_modbus_read_resp, sizeof(topic_modbus_read_resp), "devices/%s/modbus/read/response", DEVICE_ID);
+  snprintf(topic_modbus_write_req, sizeof(topic_modbus_write_req), "devices/%s/modbus/write/request", DEVICE_ID);
+  snprintf(topic_modbus_write_resp, sizeof(topic_modbus_write_resp), "devices/%s/modbus/write/response", DEVICE_ID);
+  snprintf(topic_status, sizeof(topic_status), "devices/%s/status", DEVICE_ID);
+  snprintf(lwt_topic, sizeof(lwt_topic), "devices/%s/status", DEVICE_ID); // LWT 主題
+}
+
+// MQTT 回呼函式
+void callback(char* topic, byte* payload, unsigned int length) {
+  //Serial.print("[MQTT] 收到訊息，主題 [");
+  //Serial.print(topic);
+  //Serial.print("] ");
+  char payload_copy[length + 1];
+  memcpy(payload_copy, payload, length);
+  payload_copy[length] = '\0';
+  Serial.println(payload_copy);
+
+  if (strcmp(topic, topic_led_set) == 0) {
+    handleMqttSetLED(payload, length);
+  } else if (strcmp(topic, topic_modbus_read_req) == 0) {
+    handleMqttReadModbus(payload, length);
+  } else if (strcmp(topic, topic_modbus_write_req) == 0) {
+    handleMqttWriteModbus(payload, length);
+  }
+}
+
+
+
+// MQTT 重新連線函式
+void reconnectMqtt() {
+  if (WiFi.status() != WL_CONNECTED) {
+    mqtt_connected = false;
+    return;
+  }
+  Serial.print("[MQTT] 嘗試連線 Client ID: ");
+  Serial.println(mqtt_client_id);
+  Serial.print("[MQTT] LWT 主題: ");
+  Serial.println(lwt_topic);
+  Serial.print("[MQTT] LWT 內容: ");
+  Serial.println(lwt_payload);
+
+  if (client.connect(mqtt_client_id, NULL, NULL, lwt_topic, lwt_qos, lwt_retain, lwt_payload)) {
+    Serial.println("[MQTT] 已連線");
+    mqtt_connected = true;
+
+    // 訂閱針對此設備的命令主題
+    client.subscribe(topic_led_set);
+    client.subscribe(topic_modbus_read_req);
+    client.subscribe(topic_modbus_write_req);
+    Serial.println("[MQTT] 已訂閱主題: ");
+    Serial.println(topic_led_set);
+    // ... (其他訂閱日誌)
+
+    // 發佈上線訊息
+    JSONVar onlineMsg;
+    onlineMsg["Status"] = "online";
+    onlineMsg["IP"] = WiFi.localIP().toString();
+    onlineMsg["DeviceId"] = DEVICE_ID; // 使用宏定義的 DEVICE_ID
+    String jsonString = JSON.stringify(onlineMsg);
+    // 發佈到此設備的狀態主題，並設定 retain
+    client.publish(topic_status, jsonString.c_str(), true);
+    Serial.println("[MQTT] 已發佈上線狀態: " + jsonString + " 到主題: " + String(topic_status));
+
+  } else {
+    Serial.print("[MQTT] 連線失敗, rc=");
+    Serial.println(client.state());
+    mqtt_connected = false;
+  }
+}
+
+
+/*
+// OTA 設定
+void setupOTA() {
+  ArduinoOTA.setHostname("esp32-1F_IOT");
+  ArduinoOTA.setPassword("0000"); // 使用強密碼
+  // 可選：ArduinoOTA.setPasswordHash("md5_hash_of_password");
+
+  ArduinoOTA.onStart([]() { Serial.println("[OTA] 開始更新..."); });
+  ArduinoOTA.onEnd([]() { Serial.println("[OTA] 更新完成！"); });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("[OTA] 進度: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("[OTA] 錯誤 [%u]: ", error);
+  });
+
+  ArduinoOTA.begin();
+  Serial.println("[OTA] 初始化完成");
+}
+*/
+
+// LED 狀態控制
+void setLEDState(bool state) {
+  digitalWrite(LED_BUILTIN, state ? HIGH : LOW);
+  Serial.println("[LED] 狀態設為: " + String(state ? "開啟" : "關閉"));
+}
+
+
+
+//--------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_BUILTIN, OUTPUT);
+  setLEDState(false);
+  Serial.println("[主程式] 初始化開始...");
+
+  // 設定唯一的 MQTT Client ID
+  snprintf(mqtt_client_id, sizeof(mqtt_client_id), "esp32-%s", DEVICE_ID);
+  buildTopics(); // 建立主題字串
+
+  // 設定 LWT payload
+  JSONVar lwtMsgJson;
+  lwtMsgJson["Status"] = "offline";
+  lwtMsgJson["DeviceId"] = DEVICE_ID;
+  String lwtJsonString = JSON.stringify(lwtMsgJson);
+  strncpy(lwt_payload, lwtJsonString.c_str(), sizeof(lwt_payload) - 1);
+  lwt_payload[sizeof(lwt_payload) - 1] = '\0'; // 確保 null-terminated
+
+  // 初始化看門狗計時器
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 30000, // 30 秒超時
+    .trigger_panic = true // 超時時觸發重啟
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+
+  // 初始化 WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("[WiFi] 連線中...");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WiFi] 連線成功,IP: " + WiFi.localIP().toString());
+    setLEDState(true);
+    // 在 WiFi 連線成功後初始化 OTA
+    //setupOTA();
+  } else {
+    Serial.println("[WiFi] 連線失敗");
+    setLEDState(false);
+  }
+
+  // 初始化 Modbus
+  Serial2.begin(MODBUS_SERIAL_BAUD, SERIAL_8N1, MODBUS_RX_PIN, MODBUS_TX_PIN);
+  //Serial2.setTimeout(1000);
+  Serial.println("[Modbus] Serial2 已初始化");
+
+  // 設定 MQTT
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  client.setBufferSize(MSG_BUFFER_SIZE);
+
+  // 創建連線管理任務
+  xTaskCreatePinnedToCore(
+    printRSSITask, "PrintRSSITask", 8192, NULL, 1, NULL, 0
+  );
+  Serial.println("[主程式] 連線管理任務已創建");
+
+  // 檢查堆記憶體
+  Serial.printf("[主程式] 可用堆記憶體: %d bytes\n", ESP.getFreeHeap());
+}
+
+void loop() {
+  ArduinoOTA.handle();
+  if (WiFi.status() == WL_CONNECTED && client.connected()) {
+    client.loop();
+  }
+  esp_task_wdt_reset();
+  delay(20);
+}
+//--------------------------------------------------------------------------------
+//--------------------------------------------------------------------------------
+
+
+
+void printRSSITask(void *pvParameters) {
+  Serial.println("[連線任務] 啟動於核心 " + String(xPortGetCoreID()));
+  unsigned long lastReconnectAttempt = 0;
+  const unsigned long reconnectInterval = 30000;
+  const unsigned long wifiTimeout = 15000;
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      if (millis() - lastReconnectAttempt >= reconnectInterval) {
+        Serial.println("[連線任務] WiFi 已斷線，嘗試重新連線...");
+        WiFi.disconnect(true);
+        delay(100);
+        WiFi.begin(ssid, password);
+        unsigned long start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < wifiTimeout) {
+          Serial.print(".");
+          delay(500);
+        }
+        Serial.println();
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.println("[連線任務] WiFi 連線成功,IP: " + WiFi.localIP().toString());
+          setLEDState(true);
+          // 重新初始化 OTA
+          //setupOTA();
+          JSONVar onlineMsg;
+          onlineMsg["Status"] = "online";
+          onlineMsg["IP"] = WiFi.localIP().toString();
+          String jsonString = JSON.stringify(onlineMsg);
+          client.publish(topic_status, jsonString.c_str());
+        } else {
+          Serial.println("[連線任務] WiFi 連線失敗");
+          setLEDState(false);
+        }
+        lastReconnectAttempt = millis();
+      }
+    } else {
+      if (!client.connected()) {
+        reconnectMqtt();
+      } else {
+        long rssi = WiFi.RSSI();
+        Serial.println("[連線任務] WiFi 訊號: " + String(rssi) + " dBm");
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
+
+
+// 處理 LED 控制
+void handleMqttSetLED(byte* payload, unsigned int length) {
+  JSONVar response;
+  char payloadStr[length + 1];
+  memcpy(payloadStr, payload, length);
+  payloadStr[length] = '\0';
+
+  JSONVar request = JSON.parse(payloadStr);
+  if (JSON.typeof(request) == "undefined") {
+    Serial.println("[LED控制] JSON 解析失敗");
+    response["Status"] = "error";
+    response["Message"] = "無效的 JSON payload";
+  } else if (!request.hasOwnProperty("state")) {
+    Serial.println("[LED控制] JSON 缺少 state 欄位");
+    response["Status"] = "error";
+    response["Message"] = "缺少 state 參數";
+  } else {
+    String state = (const char*)request["state"];
+    if (state == "ON") {
+      setLEDState(true);
+      response["Status"] = "success";
+      response["Message"] = "LED 已開啟";
+    } else if (state == "OFF") {
+      setLEDState(false);
+      response["Status"] = "success";
+      response["Message"] = "LED 已關閉";
+    } else {
+      Serial.println("[LED控制] 無效的 state: " + state);
+      response["Status"] = "error";
+      response["Message"] = "無效的 state 參數: " + state;
+    }
+  }
+
+  client.publish(topic_led_status, JSON.stringify(response).c_str());
+}
+
+
+// 處理 Modbus 讀取請求 (ESP32 端 .ino 檔案)
+void handleMqttReadModbus(byte* payload, unsigned int length) {
+  JSONVar response; // 用於建構回應的 JSON 物件
+  response["DeviceId"] = DEVICE_ID; // 首先填入 ESP32 自身的 DeviceId
+
+  char payloadStr[length + 1];
+  memcpy(payloadStr, payload, length);
+  payloadStr[length] = '\0';
+  Serial.println("[Modbus讀取請求] Payload: " + String(payloadStr));
+
+  JSONVar request = JSON.parse(payloadStr);
+
+  // 步驟 1: 基本的請求驗證與原始參數記錄
+  if (JSON.typeof(request) == "undefined") {
+    Serial.println("[Modbus讀取] JSON 解析失敗");
+    response["Status"] = "error";
+    response["Message"] = "無效的 JSON payload (read request)";
+    // 即使解析失敗，也嘗試發佈包含 DeviceId 和錯誤訊息的回應
+    client.publish(topic_modbus_read_resp, JSON.stringify(response).c_str());
+    return;
+  }
+
+  // 檢查必要欄位是否存在
+  if (!request.hasOwnProperty("slaveId") || !request.hasOwnProperty("address") ||
+      !request.hasOwnProperty("quantity") || !request.hasOwnProperty("functionCode")) {
+    Serial.println("[Modbus讀取] JSON 缺少必要欄位");
+    response["Status"] = "error";
+    response["Message"] = "請求缺少必要參數 (slaveId, address, quantity, functionCode)";
+    // 包含已解析的參數（如果有的話）到回應中，以便追蹤
+    if(request.hasOwnProperty("slaveId")) response["SlaveId"] = (int)request["slaveId"];
+    if(request.hasOwnProperty("address")) response["Address"] = (int)request["address"];
+    if(request.hasOwnProperty("quantity")) response["Quantity"] = (int)request["quantity"];
+    if(request.hasOwnProperty("functionCode")) response["FunctionCode"] = (int)request["functionCode"];
+    client.publish(topic_modbus_read_resp, JSON.stringify(response).c_str());
+    return;
+  }
+
+  // 從請求中提取參數
+  uint8_t slaveId = (int)request["slaveId"];
+  uint16_t relativeAddress = (int)request["address"]; // C# 端發送的相對位址
+  uint16_t modbusAddress = relativeAddress + Address_Offset; // ESP32 加上偏移量後的實際 Modbus 位址
+  uint8_t quantity = (int)request["quantity"];
+  uint8_t functionCode = (int)request["functionCode"];
+
+  // 將原始請求參數（C# 端發送的）加入回應 JSON，以便 C# 端識別
+  response["SlaveId"] = slaveId;
+  response["Address"] = relativeAddress; // 回傳 C# 發送的原始相對位址
+  response["Quantity"] = quantity;
+  response["FunctionCode"] = functionCode;
+
+  // 步驟 2: 參數有效性驗證
+  if (slaveId < 1 || slaveId > MAX_SLAVES) {
+    Serial.println("[Modbus讀取] 無效的 slaveId: " + String(slaveId));
+    response["Status"] = "error";
+    response["Message"] = "slaveId 必須介於 1 和 " + String(MAX_SLAVES) + " 之間";
+  } else if (quantity < 1 || quantity > 10) { // 保持您原有的數量限制
+    Serial.println("[Modbus讀取] 無效的 quantity: " + String(quantity));
+    response["Status"] = "error";
+    response["Message"] = "quantity 必須介於 1 和 10 之間";
+  } else {
+    // 步驟 3: 執行 Modbus 讀取操作
+    node.begin(slaveId, Serial2); // 初始化 ModbusMaster 到目標從站和序列埠
+    uint8_t result;
+    uint16_t dataBuffer[quantity]; // 根據請求的 quantity 動態調整 (或使用最大值如 data[10])
+                                   // 如果 quantity 來自 MQTT，確保它不會超過 dataBuffer 的大小
+
+    Serial.println("[Modbus讀取] 開始讀取從站 " + String(slaveId) + 
+                   ", 實際位址 " + String(modbusAddress) + 
+                   " (相對位址 " + String(relativeAddress) + ")" +
+                   ", 數量 " + String(quantity) + 
+                   ", 功能碼 " + String(functionCode));
+    
+    uint8_t retries = 3; // 重試次數
+    while (retries > 0) {
+      if (functionCode == 3) { // Read Holding Registers
+        result = node.readHoldingRegisters(modbusAddress, quantity);
+      } else if (functionCode == 4) { // Read Input Registers
+        result = node.readInputRegisters(modbusAddress, quantity);
+      } else {
+        result = 0xE1; // 自訂錯誤碼：不支援的功能碼
+        response["Message"] = "不支援的功能碼: " + String(functionCode);
+        break; 
+      }
+      if (result == node.ku8MBSuccess) break; // 成功則跳出重試
+      retries--;
+      delay(100); // 重試前延遲
+    }
+
+    // 步驟 4: 處理 Modbus 操作結果並建構回應
+    if (result == node.ku8MBSuccess) {
+      response["Status"] = "success";
+      JSONVar dataArray;
+      for (uint8_t i = 0; i < quantity; i++) {
+        dataBuffer[i] = node.getResponseBuffer(i); // 從 ModbusMaster 獲取回應數據
+        dataArray[i] = dataBuffer[i];
+      }
+      response["Data"] = dataArray; // 將讀取到的數據陣列加入 JSON
+      Serial.println("[Modbus讀取] 成功，數據: " + String(JSON.stringify(dataArray)));
+      Serial.println(" ");
+    } else {
+      response["Status"] = "error";
+      if (!response.hasOwnProperty("Message")) { // 如果前面步驟（如功能碼不支援）沒有設定過錯誤訊息
+        response["Message"] = "讀取 Modbus 失敗，錯誤碼: 0x" + String(result, HEX);
+      }
+      Serial.println("[Modbus讀取] 失敗，錯誤碼: 0x" + String(result, HEX));
+      Serial.println(" ");
+    }
+  }
+
+  // 步驟 5: 發佈回應到 MQTT
+  String responseString = JSON.stringify(response);
+  client.publish(topic_modbus_read_resp, responseString.c_str());
+  //Serial.println("[Modbus讀取回應] 發佈到 " + String(topic_modbus_read_resp) + ": " + responseString);
+}
+
+// 處理 Modbus 寫入
+void handleMqttWriteModbus(byte* payload, unsigned int length) {
+  JSONVar response;
+  char payloadStr[length + 1];
+  memcpy(payloadStr, payload, length);
+  payloadStr[length] = '\0';
+
+  JSONVar request = JSON.parse(payloadStr);
+  if (JSON.typeof(request) == "undefined") {
+    Serial.println("[Modbus寫入] JSON 解析失敗");
+    response["Status"] = "error";
+    response["Message"] = "無效的 JSON payload";
+    client.publish(topic_modbus_write_resp, JSON.stringify(response).c_str());
+    return;
+  }
+
+  if (!request.hasOwnProperty("slaveId") || !request.hasOwnProperty("address") ||
+      !request.hasOwnProperty("value")) {
+    Serial.println("[Modbus寫入] JSON 缺少必要欄位");
+    response["Status"] = "error";
+    response["Message"] = "缺少必要參數 (slaveId, address, value)";
+    client.publish(topic_modbus_write_resp, JSON.stringify(response).c_str());
+    return;
+  }
+
+  uint8_t slaveId = (int)request["slaveId"];
+  uint16_t address = (int)request["address"] + Address_Offset;
+  uint16_t value = (int)request["value"];
+
+  if (slaveId < 1 || slaveId > MAX_SLAVES) {
+    Serial.println("[Modbus寫入] 無效的 slaveId: " + String(slaveId));
+    response["Status"] = "error";
+    response["Message"] = "slaveId 必須介於 1 和 " + String(MAX_SLAVES) + " 之間";
+  } else {
+    node.begin(slaveId, Serial2);
+    uint8_t result;
+
+    Serial.println("[Modbus寫入] 開始寫入從站 " + String(slaveId) + ", 位址 " + String(address) + ", 值 " + String(value));
+    uint8_t retries = 3;
+    while (retries > 0) {
+      result = node.writeSingleRegister(address, value);
+      if (result == node.ku8MBSuccess) break;
+      retries--;
+      delay(100);
+    }
+
+    if (result == node.ku8MBSuccess) {
+      response["Status"] = "success";
+      response["SlaveId"] = slaveId;
+      response["Message"] = "寫入成功";
+      Serial.println("[Modbus寫入] 成功");
+    } else {
+      response["Status"] = "error";
+      response["SlaveId"] = slaveId;
+      response["Message"] = "寫入失敗，錯誤碼: 0x" + String(result, HEX);
+      Serial.println("[Modbus寫入] 失敗，錯誤碼: 0x" + String(result, HEX));
+    }
+  }
+
+  client.publish(topic_modbus_write_resp, JSON.stringify(response).c_str());
+}
