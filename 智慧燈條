@@ -1,0 +1,438 @@
+#include <ETH.h>
+#include <WiFi.h> // OTA 需要 WiFi.h，即使我們用乙太網路
+#include <ArduinoOTA.h>
+#include <ModbusIP_ESP8266.h>
+#include <FastLED.h>
+
+// ----------------------------------------------------------------
+// 1. 硬體與網路設定 (請根據您的硬體修改)
+// ----------------------------------------------------------------
+
+// --- 乙太網路 PHY (IP101) 設定 ---
+#define ETH_PHY_TYPE   ETH_PHY_IP101
+#define ETH_PHY_ADDR   1
+#define ETH_MDC_PIN    23
+#define ETH_MDIO_PIN   18
+#define ETH_POWER_PIN  5
+#define ETH_CLK_MODE   ETH_CLOCK_GPIO0_IN
+
+// --- 靜態 IP 設定 ---
+IPAddress ethIP(192, 168, 1, 70);    // ESP32 的乙太網路靜態 IP
+IPAddress ethGateway(192, 168, 1, 1); // 您的網路閘道
+IPAddress ethSubnet(255, 255, 255, 0); // 您的子網路遮罩
+
+// --- FastLED 設定 ---
+#define LED_PIN         4
+#define NUM_LEDS        120 // 根據您的燈條修改
+#define LED_TYPE        WS2812B
+#define COLOR_ORDER     GRB
+CRGB leds[NUM_LEDS];
+
+// --- OTA 主機名稱 ---
+const char* ota_hostname = "esp32-ethernet-led";
+const char* ota_password = "Sanjet25653819"; 
+
+// --- LED 效果計時器間隔 ---
+// 您可以調整這些數值來改變動態效果的速度
+//const int flowinterval = 10;   // 流水燈速度 (ms)，數值越小越快
+const int alarminterval = 20;  // 故障呼吸燈速度 (ms)，數值越小越快
+
+// ----------------------------------------------------------------
+// 2. Modbus 與 LED 控制變數
+// ----------------------------------------------------------------
+ModbusIP mb; // 建立 ModbusIP 物件
+
+// --- Modbus 暫存器地址定義 ---
+const int MODE_REG = 0;       // 對應地址 40001
+const int RED_REG = 1;        // 對應地址 40002
+const int GREEN_REG = 2;      // 對應地址 40003
+const int BLUE_REG = 3;       // 對應地址 40004
+const int BRIGHTNESS_REG = 4; // 對應地址 40005
+const int SPEED_REG = 5;      // 對應地址 40006
+const int PARAM_REG = 6;      // 對應地址 40007
+
+// --- 用於在核心之間傳遞資料的全域變數 ---
+volatile int g_ledMode=0;
+volatile int g_red = 0;
+volatile int g_green = 0;
+volatile int g_blue = 0;
+volatile int g_brightness = 200;// 預設整體亮度
+volatile int g_speed = 255;
+volatile int g_param = 0;//(新!!) 用於模式6的參數
+
+// --- FreeRTOS 任務控制代碼 ---
+TaskHandle_t ModbusTaskHandle;
+
+
+// ================================================================
+// === 您提供的 LED 功能函式 (已整合與優化) ===
+// ================================================================
+
+//----------------------------------------------------------------------------------------//
+// 待機呼吸燈-- (模式6)
+// 根據傳入的參數 para 決定亮燈的區段
+void updateBreathEffect(int para) {
+  unsigned long currentMillis = millis();
+  static unsigned long previousMillis = 0;
+  static int breathBrightness = 255;  // 呼吸燈的內部亮度變數
+  static bool Direction = true;   
+  int StepOn = 10;
+  int StepOff = 10;
+  /*
+  // 恢復被註解的呼吸亮度計算邏輯
+  if (currentMillis - previousMillis >= 20) { // 使用固定的 interval
+    previousMillis = currentMillis;
+    
+    if (Direction) {
+      breathBrightness += StepOn;
+    } else {
+      breathBrightness -= StepOff;
+    }
+
+    if (breathBrightness >= 255) {
+      breathBrightness = 255;
+      Direction = false;
+    } else if (breathBrightness <= 0) {
+      breathBrightness = 0;
+      Direction = true;
+    }
+  }
+  */
+  // 計算燈珠範圍
+  uint16_t regValue = constrain(para, 0, 1315);
+  // 您的映射邏輯: map(regValue, 0, 1800, 114, 0);
+  // 這會讓 regValue=0 時 startLed=114, regValue=1800 時 startLed=0
+  // 這是一個反向映射，我將其保留
+  int startLed = map(regValue, 0, 1800, NUM_LEDS, 0); 
+  int endLed = startLed - 32; // 亮燈長度為32顆
+
+  if (endLed < 0) {
+    endLed = 0;
+  }
+  
+  FastLED.clear(); // 先清空所有燈
+  for (int i = endLed; i < startLed; i++) {
+    // 邊界檢查，防止i超出陣列範圍
+    if(i >= 0 && i < NUM_LEDS) {
+      leds[i] = CRGB(0, breathBrightness, 0); // 綠色呼吸
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------//
+// 方向流水燈-- (模式3 & 4)
+void FlowEffect(bool directionUp) {
+  unsigned long currentMillis = millis();
+  static unsigned long previousMillis = 0;
+  static bool isLighting = true;
+  static int currentIndex = 0;
+
+  if (currentMillis - previousMillis >= (256 - g_speed)) { // g_speed 越大，延遲越小，速度越快
+    previousMillis = currentMillis;
+    
+    FastLED.clear();
+    
+    if (isLighting) {
+      // 點亮階段
+      if (directionUp) {
+        for (int i = 0; i <= currentIndex; i++) {
+          leds[i] = CRGB(222, 36, 1); 
+        }
+      } else {
+        for (int i = NUM_LEDS - 1; i >= NUM_LEDS - 1 - currentIndex; i--) {
+          leds[i] = CRGB(222, 36, 1); 
+        }
+      }
+
+      currentIndex++;
+      if (currentIndex >= NUM_LEDS) {
+        isLighting = false;
+        currentIndex = 0;
+      }
+    } else {
+      // 熄滅階段
+      if (directionUp) {
+        for (int i = currentIndex; i < NUM_LEDS; i++) {
+          leds[i] = CRGB(222, 36, 1);  
+        }
+      } else {
+        for (int i = NUM_LEDS - 1 - currentIndex; i >= 0; i--) {
+          leds[i] = CRGB(222, 36, 1);  
+        }
+      }
+
+      currentIndex++;
+      if (currentIndex >= NUM_LEDS) {
+        isLighting = true;
+        currentIndex = 0;
+      }
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------//
+// 故障狀態呼吸燈-- (模式2)
+void AlarmBreath() {
+  unsigned long currentMillis = millis();
+  static unsigned long previousMillis = 0;
+  static int breathBrightness = 0; // 內部的亮度控制
+  static bool Direction = true;    // ON/OFF方向控制
+  static int StepOn = 15;
+  static int StepOff = 25;
+  
+  if (currentMillis - previousMillis >= alarminterval) {
+    previousMillis = currentMillis;
+
+    if (Direction) {
+      breathBrightness += StepOn;
+    } else {
+      breathBrightness -= StepOff;
+    }
+    
+    if (breathBrightness >= 255) {
+      breathBrightness = 255;
+      Direction = false;
+    } else if (breathBrightness <= 0) {
+      breathBrightness = 0;
+      Direction = true;
+    }
+
+    fill_solid(leds, NUM_LEDS, CRGB(breathBrightness, 0, 0)); // 紅色呼吸
+  }
+}
+
+//----------------------------------------------------------------------------------------//
+// 夜店模式燈效 (模式5)
+void NightClubEffect() {
+  unsigned long currentMillis = millis();
+
+  static const long colorChangeInterval = 80;   
+  static const long strobeInterval = 100;     
+  static uint8_t hue = 0;                    
+  static bool strobeState = false;           
+  static int colorBlockPosition = 0;         
+
+  // 彩虹漸變效果
+  static unsigned long rainbowPreviousMillis = 0;
+  if (currentMillis - rainbowPreviousMillis >= colorChangeInterval) {
+    rainbowPreviousMillis = currentMillis;
+    hue += 2;
+    fill_rainbow(leds, NUM_LEDS, hue, 7);
+  }
+
+  // 頻閃效果
+  static unsigned long strobePreviousMillis = 0;
+  if (currentMillis - strobePreviousMillis >= strobeInterval) {
+    strobePreviousMillis = currentMillis;
+    strobeState = !strobeState;
+    if(strobeState) {
+      for(int i=0; i<NUM_LEDS; i++) { leds[i] += CRGB::White; }
+    }
+  }
+
+  // 流動色塊效果
+  static unsigned long blockPreviousMillis = 0;
+  if (currentMillis - blockPreviousMillis >= 100) {
+    blockPreviousMillis = currentMillis;
+    colorBlockPosition = (colorBlockPosition + 1) % NUM_LEDS;
+    for(int i=0; i<10; i++) {
+      int pos = (colorBlockPosition + i) % NUM_LEDS;
+      leds[pos] = CHSV(hue + 128, 255, 255); // 對比色
+    }
+  }
+}
+
+// ================================================================
+// === 核心系統程式碼 (與之前相同，但有微調) ===
+// ================================================================
+// 1. 新增 debug 輸出功能，用於顯示 master 發送的 Modbus 資料變更
+// 2. 增加檢查是否有暫存器變化再更新全域變數，避免不必要的寫入
+// 3. 移除未使用變數與簡化邏輯結構
+// ----------------------------------------------------------------
+// 3. Modbus 伺服器任務 (運行於核心 0)
+// ----------------------------------------------------------------
+void ModbusTask(void *pvParameters) {
+  Serial.println("Modbus TCP 任務已在核心 0 上啟動");
+  int prev_ledMode = g_ledMode;
+  int prev_red = g_red;
+  int prev_green = g_green;
+  int prev_blue = g_blue;
+  int prev_brightness = g_brightness;
+  int prev_speed = g_speed;
+  int prev_param = g_param;
+
+  for (;;) {
+    mb.task();
+
+    // 比較並更新暫存器變數，若有變更則打印
+    int mode = mb.Hreg(MODE_REG);
+    if (mode != prev_ledMode) {
+      Serial.printf("[Modbus] MODE 改變: %d -> %d\n", prev_ledMode, mode);
+      prev_ledMode = g_ledMode = mode;
+    }
+
+    int red = mb.Hreg(RED_REG);
+    if (red != prev_red) {
+      Serial.printf("[Modbus] RED 改變: %d -> %d\n", prev_red, red);
+      prev_red = g_red = red;
+    }
+
+    int green = mb.Hreg(GREEN_REG);
+    if (green != prev_green) {
+      Serial.printf("[Modbus] GREEN 改變: %d -> %d\n", prev_green, green);
+      prev_green = g_green = green;
+    }
+
+    int blue = mb.Hreg(BLUE_REG);
+    if (blue != prev_blue) {
+      Serial.printf("[Modbus] BLUE 改變: %d -> %d\n", prev_blue, blue);
+      prev_blue = g_blue = blue;
+    }
+
+    int bright = mb.Hreg(BRIGHTNESS_REG);
+    if (bright != prev_brightness) {
+      Serial.printf("[Modbus] BRIGHTNESS 改變: %d -> %d\n", prev_brightness, bright);
+      prev_brightness = g_brightness = bright;
+    }
+
+    int spd = mb.Hreg(SPEED_REG);
+    if (spd != prev_speed) {
+      Serial.printf("[Modbus] SPEED 改變: %d -> %d\n", prev_speed, spd);
+      prev_speed = g_speed = spd;
+    }
+
+    int param = mb.Hreg(PARAM_REG);
+    if (param != prev_param) {
+      Serial.printf("[Modbus] PARAM 改變: %d -> %d\n", prev_param, param);
+      prev_param = g_param = param;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ----------------------------------------------------------------
+// 4. LED 效果主控函式 (由核心 1 的 loop 呼叫)
+// ----------------------------------------------------------------
+void updateLedController() {
+  switch (g_ledMode) {
+    case 0: // 模式 0: 關閉
+      FastLED.clear();
+      break;
+
+    case 1: // 模式 1: 靜態單色
+      fill_solid(leds, NUM_LEDS, CRGB(g_red, g_green, g_blue));
+      break;
+      
+    case 2: // 模式 2: 故障呼吸燈 (紅色)
+      AlarmBreath();
+      break;
+
+    case 3: // 模式 3: 方向流水燈 (上)
+      FlowEffect(true);
+      break;
+      
+    case 4: // 模式 4: 方向流水燈 (下)
+      FlowEffect(false);
+      break;
+
+    case 5: // 模式 5: 夜店模式
+      NightClubEffect();
+      break;
+
+    case 6: // 模式 6: 待機呼吸燈 (綠色，帶參數)
+      updateBreathEffect(g_param);
+      break;
+      
+    default: // 未知模式，關閉
+      FastLED.clear();
+      break;
+  }
+}
+
+// ----------------------------------------------------------------
+// 5. Arduino 主要設定函式 (運行於核心 1)
+// ----------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nESP32 乙太網路 LED 控制器啟動中 ...");
+
+  //---------------------------------------------------------------
+  // --- 初始化乙太網路 ---
+  Serial.println("正在啟動乙太網路...");
+  // 某些板子需要 GPIO0 的時脈訊號，加上這行更穩定
+  pinMode(ETH_POWER_PIN, OUTPUT);
+  digitalWrite(ETH_POWER_PIN, HIGH);  // 拉高解除 Reset
+  delay(100);
+   
+  pinMode(0, INPUT_PULLUP);
+  ETH.begin(
+    ETH_PHY_TYPE,     // 🟢 正確第 1 參數：PHY 類型
+    ETH_PHY_ADDR,     // 🟢 PHY 地址
+    ETH_MDC_PIN,      // 🟢 MDC 腳位
+    ETH_MDIO_PIN,     // 🟢 MDIO 腳位
+    ETH_POWER_PIN,    // 🟢 電源腳位
+    ETH_CLK_MODE      // 🟢 REF_CLK 模式
+  );
+  //---------------------------------------------------------------
+
+  // 設定靜態 IP
+  if (!ETH.config(ethIP, ethGateway, ethSubnet)) {
+    Serial.println("設定靜態 IP 失敗！");
+  }
+
+  Serial.println("等待乙太網路連接...");
+  while (!ETH.linkUp()) { delay(500); Serial.print("."); }
+  Serial.println("\n乙太網路已連接");
+  Serial.print("IP 位址: "); Serial.println(ETH.localIP());
+
+  // --- 初始化 FastLED ---
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
+  FastLED.setBrightness(g_brightness);
+  FastLED.clear();
+  FastLED.show();
+  Serial.println("FastLED 初始化完成");
+
+  // --- 設定 Modbus 伺服器 ---
+  mb.addHreg(MODE_REG, g_ledMode);
+  mb.addHreg(RED_REG, g_red);
+  mb.addHreg(GREEN_REG, g_green);
+  mb.addHreg(BLUE_REG, g_blue);
+  mb.addHreg(BRIGHTNESS_REG, g_brightness);
+  mb.addHreg(SPEED_REG, g_speed);
+  mb.addHreg(PARAM_REG, g_param); // (新!!) 初始化參數暫存器
+  mb.server();
+  Serial.println("Modbus TCP 伺服器已設定");
+  
+  // --- 設定 OTA ---
+  ArduinoOTA.setHostname(ota_hostname);
+  ArduinoOTA.setPassword(ota_password);
+  ArduinoOTA.onStart([]() { Serial.println("OTA 開始更新..."); }).onEnd([]() { Serial.println("\nOTA 更新完成"); }).onProgress([](unsigned int progress, unsigned int total) { Serial.printf("進度: %u%%\r", (progress / (total / 100))); }).onError([](ota_error_t error) { Serial.printf("OTA 錯誤 [%u]\n", error); });
+  ArduinoOTA.begin();
+  Serial.println("OTA 服務已準備就緒");
+
+  // --- 建立並啟動 Modbus 任務，固定在核心 0 ---
+  xTaskCreatePinnedToCore(ModbusTask, "ModbusTCPServer", 4096, NULL, 1, &ModbusTaskHandle, 0);
+  
+  delay(500);
+  Serial.println("系統初始化完成，已進入主迴圈。");
+}
+
+// ----------------------------------------------------------------
+// 6. Arduino 主迴圈 (運行於核心 1)
+// ----------------------------------------------------------------
+void loop() {
+  // 處理 OTA 請求
+  ArduinoOTA.handle();
+
+  // 更新 LED 效果
+  updateLedController();
+  
+  // 將所有 LED 數據一次性發送到燈條
+  // 並應用由 Modbus 控制的全域亮度
+  FastLED.setBrightness(g_brightness);
+  FastLED.show();
+
+  // 短暫延遲
+  delay(1);
+}
